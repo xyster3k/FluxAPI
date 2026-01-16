@@ -1,0 +1,20 @@
+# Flux Schnell API Server Requirements
+
+# Core ML libraries
+torch>=2.1.0
+diffusers>=0.30.0
+transformers>=4.44.0
+accelerate>=0.33.0
+peft>=0.12.0
+
+# Image processing
+Pillow>=10.0.0
+
+# API server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Optional but recommended
+sentencepiece>=0.1.99
+protobuf>=3.20.0

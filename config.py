@@ -25,12 +25,15 @@ class Config:
     MAX_QUEUE_SIZE: int = int(os.getenv("FLUX_MAX_QUEUE", "10"))
 
     # Generation defaults
-    DEFAULT_WIDTH: int = 1024
+    DEFAULT_WIDTH: int = 576
     DEFAULT_HEIGHT: int = 1024
-    DEFAULT_STEPS: int = 4
+    DEFAULT_STEPS: int = 20
 
     # Output directory for file response format
     OUTPUT_DIR: str = os.getenv("FLUX_OUTPUT_DIR", "./generated")
+
+    # LoRA directory - can use just filename if this is set
+    LORA_DIR: str = os.getenv("FLUX_LORA_DIR", "")
 
     @classmethod
     def require_auth(cls) -> bool:

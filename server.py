@@ -38,7 +38,7 @@ from config import config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Flux Schnell API", version="2.0.0")
+app = FastAPI(title="Flux Schnell API", version="2.4.0")
 
 # Global state
 pipe = None
@@ -47,9 +47,6 @@ current_gpu: int = config.GPU_ID
 generation_queue: asyncio.Queue = None
 queue_lock = asyncio.Lock()
 model_on_gpu = False
-last_generation_time = 0
-unload_task = None
-MODEL_IDLE_TIMEOUT = 30  # Seconds to keep model on GPU after last generation
 
 
 class ResponseFormat(str, Enum):
@@ -58,16 +55,116 @@ class ResponseFormat(str, Enum):
     FILE = "file"
 
 
+class AspectRatio(str, Enum):
+    """Common aspect ratios for image generation"""
+    PORTRAIT_9_16 = "9:16"      # Vertical/portrait (default)
+    PORTRAIT_2_3 = "2:3"        # Portrait
+    PORTRAIT_3_4 = "3:4"        # Portrait
+    SQUARE = "1:1"              # Square
+    LANDSCAPE_4_3 = "4:3"       # Landscape
+    LANDSCAPE_3_2 = "3:2"       # Landscape
+    LANDSCAPE_16_9 = "16:9"     # Widescreen
+    CUSTOM = "custom"           # Use width/height directly
+
+
+# Aspect ratio multipliers (width_mult, height_mult)
+ASPECT_RATIOS = {
+    "9:16": (9, 16),
+    "2:3": (2, 3),
+    "3:4": (3, 4),
+    "1:1": (1, 1),
+    "4:3": (4, 3),
+    "3:2": (3, 2),
+    "16:9": (16, 9),
+}
+
+
+def calculate_dimensions(aspect_ratio: str, base_resolution: int = 576) -> tuple[int, int]:
+    """
+    Calculate width and height from aspect ratio.
+    Uses base_resolution as the shorter dimension.
+    Returns dimensions as multiples of 16 (Flux requirement).
+    """
+    if aspect_ratio not in ASPECT_RATIOS:
+        return base_resolution, base_resolution
+
+    w_mult, h_mult = ASPECT_RATIOS[aspect_ratio]
+
+    # Determine which dimension is shorter
+    if w_mult <= h_mult:
+        # Portrait or square: width is shorter
+        width = base_resolution
+        height = int(base_resolution * h_mult / w_mult)
+    else:
+        # Landscape: height is shorter
+        height = base_resolution
+        width = int(base_resolution * w_mult / h_mult)
+
+    # Round to nearest multiple of 16 (Flux requirement)
+    width = ((width + 8) // 16) * 16
+    height = ((height + 8) // 16) * 16
+
+    return width, height
+
+
 class GenerationRequest(BaseModel):
     prompt: str
-    width: int = Field(default=1024, ge=256, le=2048)
-    height: int = Field(default=1024, ge=256, le=2048)
-    num_inference_steps: int = Field(default=4, ge=1, le=50)
-    guidance_scale: float = Field(default=0.0, ge=0.0, le=20.0)
-    seed: Optional[int] = Field(default=None, description="Random seed. None = random")
-    lora_path: Optional[str] = None
-    lora_scale: float = Field(default=1.0, ge=0.0, le=2.0)
+
+    # Resolution settings
+    aspect_ratio: AspectRatio = Field(
+        default=AspectRatio.PORTRAIT_9_16,
+        description="Aspect ratio. Use 'custom' to specify width/height directly."
+    )
+    base_resolution: int = Field(
+        default=576, ge=256, le=2048,
+        description="Base resolution (shorter side). Only used when aspect_ratio is not 'custom'."
+    )
+    width: Optional[int] = Field(
+        default=None, ge=256, le=2048,
+        description="Width in pixels (must be multiple of 16). Only used when aspect_ratio='custom'."
+    )
+    height: Optional[int] = Field(
+        default=None, ge=256, le=2048,
+        description="Height in pixels (must be multiple of 16). Only used when aspect_ratio='custom'."
+    )
+
+    # Generation settings
+    num_inference_steps: int = Field(
+        default=20, ge=1, le=50,
+        description="Number of denoising steps."
+    )
+    guidance_scale: float = Field(
+        default=0.0, ge=0.0, le=20.0,
+        description="Classifier-free guidance scale. Note: Flux Schnell ignores this (use 0.0)."
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        description="Random seed for reproducibility. None = random seed."
+    )
+
+    # LoRA settings
+    lora_path: Optional[str] = Field(
+        default=None,
+        description="Path to LoRA file (.safetensors)"
+    )
+    lora_scale: float = Field(
+        default=1.0, ge=0.0, le=2.0,
+        description="LoRA influence strength (0.0 = no effect, 1.0 = full effect)"
+    )
+
     response_format: ResponseFormat = ResponseFormat.BINARY
+
+    def get_dimensions(self) -> tuple[int, int]:
+        """Get final width and height based on aspect_ratio or custom dimensions."""
+        if self.aspect_ratio == AspectRatio.CUSTOM:
+            # Use custom dimensions, round to multiple of 16
+            w = self.width or 576
+            h = self.height or 1024
+            w = ((w + 8) // 16) * 16
+            h = ((h + 8) // 16) * 16
+            return w, h
+        else:
+            return calculate_dimensions(self.aspect_ratio.value, self.base_resolution)
 
 
 class GenerationResponse(BaseModel):
@@ -185,20 +282,25 @@ def load_pipeline(gpu_id: int = None):
     logger.info(f"Selected GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
 
     try:
-        logger.info(f"Loading Flux Schnell model to CPU (will move to GPU on first request)...")
+        logger.info(f"Loading Flux Schnell model with CPU offload for GPU {gpu_id}...")
 
-        # Load model to CPU first - will be moved to GPU on demand
+        # Load model with CPU offload - keeps only active layers on GPU
+        # This is required because Flux uses ~25GB and inference needs additional memory
         pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
         )
 
-        # Keep model on CPU for now - will move to GPU when generation requested
-        model_on_gpu = False
+        # Enable CPU offload - moves layers to GPU only when needed
+        pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+
+        # Model is ready (uses CPU offload, not fully on GPU)
+        model_on_gpu = True  # Logically on GPU (offload handles the details)
         current_gpu = gpu_id
         current_lora = None
 
-        logger.info("Pipeline loaded to CPU RAM! Will move to GPU on first generation request.")
+        free, total = torch.cuda.mem_get_info(gpu_id)
+        logger.info(f"Pipeline ready with CPU offload! VRAM: {(total-free)/1024**3:.1f}/{total/1024**3:.1f} GB used")
 
         return pipe
 
@@ -210,87 +312,67 @@ def load_pipeline(gpu_id: int = None):
         raise
 
 
-def move_model_to_gpu():
-    """Move model from CPU to GPU for generation"""
-    global pipe, model_on_gpu, current_gpu
-
-    if model_on_gpu:
-        return  # Already on GPU
-
-    device = f"cuda:{current_gpu}"
-    logger.info(f"Moving model to GPU {current_gpu}...")
-    start_time = time.time()
-
-    pipe.to(device)
-    model_on_gpu = True
-
-    move_time = time.time() - start_time
-    free, total = torch.cuda.mem_get_info(current_gpu)
-    logger.info(f"Model moved to GPU in {move_time:.1f}s. VRAM: {(total-free)/1024**3:.1f}/{total/1024**3:.1f} GB used")
-
-
-def move_model_to_cpu():
-    """Move model from GPU to CPU to free VRAM"""
-    global pipe, model_on_gpu
-
-    if not model_on_gpu:
-        return  # Already on CPU
-
-    logger.info("Moving model to CPU to free VRAM...")
-    start_time = time.time()
-
-    pipe.to("cpu")
+def clear_gpu_cache():
+    """Clear GPU cache after generation to free up memory"""
     torch.cuda.empty_cache()
-    model_on_gpu = False
-
-    move_time = time.time() - start_time
-    free, total = torch.cuda.mem_get_info(current_gpu)
-    logger.info(f"Model moved to CPU in {move_time:.1f}s. VRAM: {(total-free)/1024**3:.1f}/{total/1024**3:.1f} GB used")
+    import gc
+    gc.collect()
 
 
-async def schedule_model_unload():
-    """Schedule model unload after idle timeout"""
-    global unload_task, last_generation_time
+def resolve_lora_path(lora_path: str) -> str:
+    """
+    Resolve LoRA path - supports:
+    1. Full absolute path: "E:/path/to/lora.safetensors"
+    2. Just filename (if LORA_DIR configured): "pinterestshort1" or "pinterestshort1.safetensors"
+    """
+    # If it's already an absolute path that exists, use it
+    if os.path.isabs(lora_path) and os.path.exists(lora_path):
+        return lora_path
 
-    # Cancel existing unload task if any
-    if unload_task and not unload_task.done():
-        unload_task.cancel()
+    # If LORA_DIR is configured, try to find the file there
+    if config.LORA_DIR:
+        lora_dir = Path(config.LORA_DIR)
 
-    async def unload_after_timeout():
-        await asyncio.sleep(MODEL_IDLE_TIMEOUT)
-        # Check if no new generations happened during sleep
-        if time.time() - last_generation_time >= MODEL_IDLE_TIMEOUT:
-            if model_on_gpu and generation_queue.qsize() == 0:
-                logger.info(f"Model idle for {MODEL_IDLE_TIMEOUT}s, moving to CPU...")
-                # Run in executor since it's blocking
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, move_model_to_cpu)
+        # Try exact filename
+        full_path = lora_dir / lora_path
+        if full_path.exists():
+            return str(full_path)
 
-    unload_task = asyncio.create_task(unload_after_timeout())
+        # Try adding .safetensors extension
+        if not lora_path.endswith('.safetensors'):
+            full_path = lora_dir / f"{lora_path}.safetensors"
+            if full_path.exists():
+                return str(full_path)
+
+    # If nothing found, return original (will fail with clear error)
+    return lora_path
 
 
 def load_lora(lora_path: str, scale: float = 1.0):
     """Load LoRA weights into the pipeline"""
     global pipe, current_lora
 
-    if current_lora == lora_path:
-        logger.info(f"LoRA already loaded: {lora_path}")
+    # Resolve the path (supports just filename if LORA_DIR configured)
+    resolved_path = resolve_lora_path(lora_path)
+
+    if current_lora == resolved_path:
+        logger.info(f"LoRA already loaded: {resolved_path}")
         # Just update scale if needed
         pipe.set_adapters(["default"], adapter_weights=[scale])
         return
 
     try:
-        logger.info(f"Loading LoRA from: {lora_path}")
+        logger.info(f"Loading LoRA from: {resolved_path}")
 
         # Unload previous LoRA if any
         if current_lora is not None:
             pipe.unload_lora_weights()
 
         # Load new LoRA
-        pipe.load_lora_weights(lora_path, adapter_name="default")
+        pipe.load_lora_weights(resolved_path, adapter_name="default")
         pipe.set_adapters(["default"], adapter_weights=[scale])
 
-        current_lora = lora_path
+        current_lora = resolved_path
         logger.info(f"LoRA loaded successfully with scale {scale}")
 
     except Exception as e:
@@ -301,32 +383,32 @@ def load_lora(lora_path: str, scale: float = 1.0):
 def _sync_generate(request: GenerationRequest) -> tuple:
     """
     Synchronous generation function for use in thread pool.
-    Returns (image_bytes, seed, generation_time_ms)
+    Returns (image_bytes, seed, generation_time_ms, width, height)
     """
-    global pipe, current_gpu, last_generation_time
+    global pipe, current_gpu
 
     start_time = time.time()
 
     # Determine seed
     seed = request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
 
-    # Move model to GPU if not already there
-    move_model_to_gpu()
+    # Calculate dimensions from aspect ratio
+    width, height = request.get_dimensions()
 
     # Load LoRA if specified
     if request.lora_path:
         load_lora(request.lora_path, request.lora_scale)
 
-    logger.info(f"Generating on GPU {current_gpu}: '{request.prompt[:50]}...' seed={seed}")
+    logger.info(f"Generating on GPU {current_gpu}: '{request.prompt[:50]}...' "
+                f"seed={seed}, {width}x{height}, steps={request.num_inference_steps}")
 
-    # Generator on GPU since model is now on GPU
-    device = f"cuda:{current_gpu}"
-    generator = torch.Generator(device=device).manual_seed(seed)
+    # Use CPU generator for reproducibility across different GPUs
+    generator = torch.Generator(device="cpu").manual_seed(seed)
 
     result = pipe(
         prompt=request.prompt,
-        width=request.width,
-        height=request.height,
+        width=width,
+        height=height,
         num_inference_steps=request.num_inference_steps,
         guidance_scale=request.guidance_scale,
         generator=generator,
@@ -340,9 +422,9 @@ def _sync_generate(request: GenerationRequest) -> tuple:
     img_bytes = img_byte_arr.getvalue()
 
     generation_time_ms = int((time.time() - start_time) * 1000)
-    logger.info(f"Generated in {generation_time_ms}ms, seed={seed}")
+    logger.info(f"Generated in {generation_time_ms}ms, seed={seed}, {width}x{height}")
 
-    return img_bytes, seed, generation_time_ms
+    return img_bytes, seed, generation_time_ms, width, height
 
 
 @app.on_event("startup")
@@ -376,15 +458,20 @@ async def root():
     return {
         "status": "online",
         "model": "FLUX.1-schnell",
-        "version": "2.2.0",
+        "version": "2.4.0",
+        "memory_mode": "cpu_offload",
         "cuda_available": torch.cuda.is_available(),
         "current_gpu": current_gpu,
-        "model_on_gpu": model_on_gpu,
-        "model_idle_timeout_sec": MODEL_IDLE_TIMEOUT,
         "gpus": gpus,
         "auth_required": config.require_auth(),
         "queue_size": generation_queue.qsize() if generation_queue else 0,
         "max_queue_size": config.MAX_QUEUE_SIZE,
+        "default_settings": {
+            "aspect_ratio": "9:16",
+            "base_resolution": 576,
+            "num_inference_steps": 20,
+            "guidance_scale": 0.75
+        }
     }
 
 
@@ -431,14 +518,10 @@ async def generate_image(
         async with queue_lock:
             # Run generation in thread pool to not block event loop
             loop = asyncio.get_event_loop()
-            img_bytes, seed, generation_time_ms = await loop.run_in_executor(
+            img_bytes, seed, generation_time_ms, width, height = await loop.run_in_executor(
                 None,
                 lambda: _sync_generate(request)
             )
-
-            # Update last generation time and schedule unload
-            global last_generation_time
-            last_generation_time = time.time()
 
     except Exception as e:
         logger.error(f"Generation failed: {e}")
@@ -450,9 +533,8 @@ async def generate_image(
         except asyncio.QueueEmpty:
             pass
 
-        # Schedule model unload after idle timeout (only if queue is empty)
-        if generation_queue.qsize() == 0:
-            await schedule_model_unload()
+        # Clear GPU cache after generation
+        clear_gpu_cache()
 
     # Return based on requested format
     if request.response_format == ResponseFormat.BINARY:
@@ -461,7 +543,9 @@ async def generate_image(
             media_type="image/png",
             headers={
                 "X-Seed": str(seed),
-                "X-Generation-Time-Ms": str(generation_time_ms)
+                "X-Generation-Time-Ms": str(generation_time_ms),
+                "X-Width": str(width),
+                "X-Height": str(height)
             }
         )
 
@@ -470,8 +554,10 @@ async def generate_image(
             "image": base64.b64encode(img_bytes).decode("utf-8"),
             "seed": seed,
             "generation_time_ms": generation_time_ms,
-            "width": request.width,
-            "height": request.height
+            "width": width,
+            "height": height,
+            "aspect_ratio": request.aspect_ratio.value,
+            "num_steps": request.num_inference_steps
         })
 
     elif request.response_format == ResponseFormat.FILE:
@@ -485,8 +571,10 @@ async def generate_image(
             "file_path": str(file_path.absolute()),
             "seed": seed,
             "generation_time_ms": generation_time_ms,
-            "width": request.width,
-            "height": request.height
+            "width": width,
+            "height": height,
+            "aspect_ratio": request.aspect_ratio.value,
+            "num_steps": request.num_inference_steps
         })
 
 
@@ -562,17 +650,22 @@ async def switch_gpu(request: GPUSwitchRequest, _: bool = Depends(verify_api_key
 if __name__ == "__main__":
     print(f"""
     ========================================
-    Flux Schnell API Server v2.2.0
+    Flux Schnell API Server v2.4.0
     ========================================
     Host: {config.HOST}
     Port: {config.PORT}
     Auth: {'Enabled' if config.require_auth() else 'Disabled (set FLUX_API_KEY in .env)'}
     Max Queue: {config.MAX_QUEUE_SIZE}
-    GPU Idle Timeout: {MODEL_IDLE_TIMEOUT}s
+    Memory Mode: CPU Offload
     ========================================
-    Model loads to CPU on startup.
-    First request moves model to GPU.
-    Model stays on GPU for {MODEL_IDLE_TIMEOUT}s after last request.
+    Default Settings:
+      Aspect Ratio: 9:16 (portrait)
+      Base Resolution: 576px (shorter side)
+      Inference Steps: 20
+      LoRA Scale: 0.1
+    ========================================
+    Using CPU offload - model layers move to
+    GPU only when needed during inference.
     ========================================
     """)
 

@@ -1,10 +1,15 @@
 """
-Flux Schnell Image Generation API Server
+Flux 2 Klein 4B Image Generation API Server
 Production-ready with authentication, queuing, and flexible response formats
+
+Model: FLUX.2-klein-4B (Apache 2.0 license - commercial use allowed)
+- 4B parameters (3x smaller than Schnell)
+- Sub-second generation with only 4 steps
+- Requires only ~13GB VRAM
 
 Setup:
 1. Copy .env.example to .env and configure
-2. pip install -r requirements.txt
+2. pip install -U diffusers
 3. python server.py
 4. Server runs on http://localhost:7860
 """
@@ -23,7 +28,7 @@ from pathlib import Path
 from enum import Enum
 from typing import Optional
 
-from diffusers import FluxPipeline
+from diffusers import Flux2KleinPipeline
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
@@ -38,7 +43,7 @@ from config import config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Flux Schnell API", version="2.4.0")
+app = FastAPI(title="Flux 2 Klein 4B API", version="3.0.0")
 
 # Global state
 pipe = None
@@ -47,6 +52,38 @@ current_gpu: int = config.GPU_ID
 generation_queue: asyncio.Queue = None
 queue_lock = asyncio.Lock()
 model_on_gpu = False
+
+
+# ============================================
+# Dynamic Runtime Settings (changeable via API)
+# ============================================
+class RuntimeSettings:
+    """Server-side defaults that can be changed on the fly via API"""
+    def __init__(self):
+        self.num_inference_steps: int = 4  # Klein 4B distilled needs only 4 steps!
+        self.guidance_scale: float = 1.0   # Klein uses 1.0 guidance
+        self.aspect_ratio: str = "9:16"
+        self.base_resolution: int = 576
+        self.lora_path: Optional[str] = None  # Disabled by default
+        self.lora_scale: float = 0.0  # Disabled by default
+        self.response_format: str = "base64"
+        self.max_sequence_length: int = 512  # T5 encoder max tokens
+
+    def to_dict(self) -> dict:
+        return {
+            "num_inference_steps": self.num_inference_steps,
+            "guidance_scale": self.guidance_scale,
+            "aspect_ratio": self.aspect_ratio,
+            "base_resolution": self.base_resolution,
+            "lora_path": self.lora_path,
+            "lora_scale": self.lora_scale,
+            "response_format": self.response_format,
+            "max_sequence_length": self.max_sequence_length
+        }
+
+
+# Global runtime settings instance
+runtime_settings = RuntimeSettings()
 
 
 class ResponseFormat(str, Enum):
@@ -110,14 +147,14 @@ def calculate_dimensions(aspect_ratio: str, base_resolution: int = 576) -> tuple
 class GenerationRequest(BaseModel):
     prompt: str
 
-    # Resolution settings
-    aspect_ratio: AspectRatio = Field(
-        default=AspectRatio.PORTRAIT_9_16,
-        description="Aspect ratio. Use 'custom' to specify width/height directly."
+    # Resolution settings - None means use runtime_settings default
+    aspect_ratio: Optional[str] = Field(
+        default=None,
+        description="Aspect ratio (9:16, 1:1, 16:9, custom, etc.). None = use server default."
     )
-    base_resolution: int = Field(
-        default=576, ge=256, le=2048,
-        description="Base resolution (shorter side). Only used when aspect_ratio is not 'custom'."
+    base_resolution: Optional[int] = Field(
+        default=None, ge=256, le=2048,
+        description="Base resolution (shorter side). None = use server default."
     )
     width: Optional[int] = Field(
         default=None, ge=256, le=2048,
@@ -128,35 +165,59 @@ class GenerationRequest(BaseModel):
         description="Height in pixels (must be multiple of 16). Only used when aspect_ratio='custom'."
     )
 
-    # Generation settings
-    num_inference_steps: int = Field(
-        default=20, ge=1, le=50,
-        description="Number of denoising steps."
+    # Generation settings - None means use runtime_settings default
+    num_inference_steps: Optional[int] = Field(
+        default=None, ge=1, le=50,
+        description="Number of denoising steps. None = use server default."
     )
-    guidance_scale: float = Field(
-        default=0.0, ge=0.0, le=20.0,
-        description="Classifier-free guidance scale. Note: Flux Schnell ignores this (use 0.0)."
+    guidance_scale: Optional[float] = Field(
+        default=None, ge=0.0, le=20.0,
+        description="CFG scale (Klein 4B uses 1.0). None = use server default."
     )
     seed: Optional[int] = Field(
         default=None,
         description="Random seed for reproducibility. None = random seed."
     )
 
-    # LoRA settings
+    # LoRA settings - None means use runtime_settings default
     lora_path: Optional[str] = Field(
         default=None,
-        description="Path to LoRA file (.safetensors)"
+        description="LoRA file (.safetensors). None = use server default. Empty string = no LoRA."
     )
-    lora_scale: float = Field(
-        default=1.0, ge=0.0, le=2.0,
-        description="LoRA influence strength (0.0 = no effect, 1.0 = full effect)"
+    lora_scale: Optional[float] = Field(
+        default=None, ge=0.0, le=2.0,
+        description="LoRA strength. None = use server default."
     )
 
-    response_format: ResponseFormat = ResponseFormat.BINARY
+    response_format: Optional[str] = Field(
+        default=None,
+        description="Response format (binary, base64, file). None = use server default."
+    )
+    max_sequence_length: Optional[int] = Field(
+        default=None, ge=77, le=512,
+        description="Max tokens for T5 encoder (77-512). CLIP is always 77. None = use server default (512)."
+    )
+
+    def get_effective_values(self) -> dict:
+        """Get effective values with runtime_settings defaults applied"""
+        return {
+            "aspect_ratio": self.aspect_ratio or runtime_settings.aspect_ratio,
+            "base_resolution": self.base_resolution if self.base_resolution is not None else runtime_settings.base_resolution,
+            "num_inference_steps": self.num_inference_steps if self.num_inference_steps is not None else runtime_settings.num_inference_steps,
+            "guidance_scale": self.guidance_scale if self.guidance_scale is not None else runtime_settings.guidance_scale,
+            "lora_path": self.lora_path if self.lora_path is not None else runtime_settings.lora_path,
+            "lora_scale": self.lora_scale if self.lora_scale is not None else runtime_settings.lora_scale,
+            "response_format": self.response_format or runtime_settings.response_format,
+            "max_sequence_length": self.max_sequence_length if self.max_sequence_length is not None else runtime_settings.max_sequence_length,
+        }
 
     def get_dimensions(self) -> tuple[int, int]:
         """Get final width and height based on aspect_ratio or custom dimensions."""
-        if self.aspect_ratio == AspectRatio.CUSTOM:
+        effective = self.get_effective_values()
+        aspect = effective["aspect_ratio"]
+        base_res = effective["base_resolution"]
+
+        if aspect == "custom":
             # Use custom dimensions, round to multiple of 16
             w = self.width or 576
             h = self.height or 1024
@@ -164,7 +225,7 @@ class GenerationRequest(BaseModel):
             h = ((h + 8) // 16) * 16
             return w, h
         else:
-            return calculate_dimensions(self.aspect_ratio.value, self.base_resolution)
+            return calculate_dimensions(aspect, base_res)
 
 
 class GenerationResponse(BaseModel):
@@ -189,6 +250,18 @@ class QueueStatus(BaseModel):
     is_generating: bool
 
 
+class SettingsUpdate(BaseModel):
+    """Request model for updating runtime settings"""
+    num_inference_steps: Optional[int] = Field(None, ge=1, le=50, description="Denoising steps (4 recommended for Klein 4B)")
+    guidance_scale: Optional[float] = Field(None, ge=0.0, le=20.0, description="CFG scale (1.0 recommended for Klein 4B)")
+    aspect_ratio: Optional[str] = Field(None, description="Default aspect ratio (9:16, 1:1, 16:9, etc.)")
+    base_resolution: Optional[int] = Field(None, ge=256, le=2048, description="Base resolution (shorter side)")
+    lora_path: Optional[str] = Field(None, description="Default LoRA (filename or path, use empty string to clear)")
+    lora_scale: Optional[float] = Field(None, ge=0.0, le=2.0, description="Default LoRA strength")
+    response_format: Optional[str] = Field(None, description="Default response format (binary, base64, file)")
+    max_sequence_length: Optional[int] = Field(None, ge=77, le=512, description="T5 encoder max tokens (77-512, default 512)")
+
+
 # Authentication dependency
 async def verify_api_key(x_api_key: Optional[str] = Header(None)):
     """Verify API key if authentication is enabled"""
@@ -210,7 +283,7 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)):
     return True
 
 
-FLUX_MIN_VRAM_GB = 25  # Flux Schnell needs ~25GB VRAM
+FLUX_MIN_VRAM_GB = 12  # Klein 4B needs only ~13GB VRAM (much smaller than Schnell's 24GB)
 
 
 def find_best_gpu() -> int:
@@ -229,13 +302,13 @@ def find_best_gpu() -> int:
 
 
 def load_pipeline(gpu_id: int = None):
-    """Load Flux Schnell pipeline on specified GPU"""
+    """Load Flux 2 Klein 4B pipeline on specified GPU"""
     global pipe, current_gpu, current_lora, model_on_gpu
 
     if gpu_id is None:
         gpu_id = current_gpu
 
-    logger.info(f"Loading Flux Schnell pipeline on GPU {gpu_id}...")
+    logger.info(f"Loading Flux 2 Klein 4B pipeline on GPU {gpu_id}...")
     logger.info(f"CUDA available: {torch.cuda.is_available()}")
     logger.info(f"GPU count: {torch.cuda.device_count()}")
 
@@ -251,18 +324,8 @@ def load_pipeline(gpu_id: int = None):
     total_gb = total / 1024**3
 
     if free_gb < FLUX_MIN_VRAM_GB:
-        # Try to find a better GPU
-        best_gpu = find_best_gpu()
-        best_free, _ = torch.cuda.mem_get_info(best_gpu)
-        best_free_gb = best_free / 1024**3
-
-        if best_free_gb >= FLUX_MIN_VRAM_GB and best_gpu != gpu_id:
-            logger.warning(f"GPU {gpu_id} has only {free_gb:.1f}GB free, need {FLUX_MIN_VRAM_GB}GB")
-            logger.warning(f"Switching to GPU {best_gpu} with {best_free_gb:.1f}GB free")
-            gpu_id = best_gpu
-        else:
-            logger.warning(f"GPU {gpu_id} has {free_gb:.1f}GB free, Flux needs ~{FLUX_MIN_VRAM_GB}GB!")
-            logger.warning("This may fail. Consider using a GPU with more VRAM.")
+        logger.warning(f"GPU {gpu_id} has {free_gb:.1f}GB free (minimum recommended: {FLUX_MIN_VRAM_GB}GB)")
+        logger.warning("Using CPU offload - this should still work but may be slower.")
 
     device = f"cuda:{gpu_id}"
 
@@ -282,25 +345,25 @@ def load_pipeline(gpu_id: int = None):
     logger.info(f"Selected GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
 
     try:
-        logger.info(f"Loading Flux Schnell model with CPU offload for GPU {gpu_id}...")
+        logger.info(f"Loading Flux 2 Klein 4B model for GPU {gpu_id}...")
+        logger.info("This model is 3x smaller than Schnell and generates in sub-second!")
 
-        # Load model with CPU offload - keeps only active layers on GPU
-        # This is required because Flux uses ~25GB and inference needs additional memory
-        pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-schnell",
+        # Load Klein 4B - only needs ~13GB VRAM (much smaller than Schnell's 24GB)
+        pipe = Flux2KleinPipeline.from_pretrained(
+            "black-forest-labs/FLUX.2-klein-4B",
             torch_dtype=torch.bfloat16,
         )
 
-        # Enable CPU offload - moves layers to GPU only when needed
+        # Enable CPU offload for safety (though Klein 4B usually fits entirely in 24GB)
         pipe.enable_model_cpu_offload(gpu_id=gpu_id)
 
-        # Model is ready (uses CPU offload, not fully on GPU)
-        model_on_gpu = True  # Logically on GPU (offload handles the details)
+        # Model is ready
+        model_on_gpu = True
         current_gpu = gpu_id
         current_lora = None
 
         free, total = torch.cuda.mem_get_info(gpu_id)
-        logger.info(f"Pipeline ready with CPU offload! VRAM: {(total-free)/1024**3:.1f}/{total/1024**3:.1f} GB used")
+        logger.info(f"Pipeline ready! VRAM: {(total-free)/1024**3:.1f}/{total/1024**3:.1f} GB used")
 
         return pipe
 
@@ -349,7 +412,12 @@ def resolve_lora_path(lora_path: str) -> str:
 
 
 def load_lora(lora_path: str, scale: float = 1.0):
-    """Load LoRA weights into the pipeline"""
+    """
+    Load LoRA weights into the pipeline.
+
+    WARNING: Flux Schnell LoRAs are NOT compatible with Klein 4B!
+    You need to train new LoRAs specifically for Klein 4B architecture.
+    """
     global pipe, current_lora
 
     # Resolve the path (supports just filename if LORA_DIR configured)
@@ -362,7 +430,9 @@ def load_lora(lora_path: str, scale: float = 1.0):
         return
 
     try:
-        logger.info(f"Loading LoRA from: {resolved_path}")
+        logger.warning("NOTE: Old Schnell LoRAs are NOT compatible with Klein 4B!")
+        logger.warning("You need LoRAs trained specifically for FLUX.2-klein-4B architecture.")
+        logger.info(f"Attempting to load LoRA from: {resolved_path}")
 
         # Unload previous LoRA if any
         if current_lora is not None:
@@ -377,17 +447,20 @@ def load_lora(lora_path: str, scale: float = 1.0):
 
     except Exception as e:
         logger.error(f"Failed to load LoRA: {e}")
-        raise HTTPException(status_code=500, detail=f"LoRA loading failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LoRA loading failed (note: Schnell LoRAs are NOT compatible with Klein 4B): {str(e)}")
 
 
 def _sync_generate(request: GenerationRequest) -> tuple:
     """
     Synchronous generation function for use in thread pool.
-    Returns (image_bytes, seed, generation_time_ms, width, height)
+    Returns (image_bytes, seed, generation_time_ms, width, height, effective_values)
     """
     global pipe, current_gpu
 
     start_time = time.time()
+
+    # Get effective values (request values with runtime_settings defaults)
+    effective = request.get_effective_values()
 
     # Determine seed
     seed = request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
@@ -395,12 +468,19 @@ def _sync_generate(request: GenerationRequest) -> tuple:
     # Calculate dimensions from aspect ratio
     width, height = request.get_dimensions()
 
-    # Load LoRA if specified
-    if request.lora_path:
-        load_lora(request.lora_path, request.lora_scale)
+    # Load LoRA if specified (empty string means explicitly no LoRA)
+    lora_path = effective["lora_path"]
+    lora_scale = effective["lora_scale"]
+
+    if lora_path:  # Non-empty string means load LoRA
+        load_lora(lora_path, lora_scale)
+
+    steps = effective["num_inference_steps"]
+    guidance = effective["guidance_scale"]
+    max_seq_len = effective["max_sequence_length"]
 
     logger.info(f"Generating on GPU {current_gpu}: '{request.prompt[:50]}...' "
-                f"seed={seed}, {width}x{height}, steps={request.num_inference_steps}")
+                f"seed={seed}, {width}x{height}, steps={steps}, max_tokens={max_seq_len}")
 
     # Use CPU generator for reproducibility across different GPUs
     generator = torch.Generator(device="cpu").manual_seed(seed)
@@ -409,9 +489,10 @@ def _sync_generate(request: GenerationRequest) -> tuple:
         prompt=request.prompt,
         width=width,
         height=height,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
         generator=generator,
+        max_sequence_length=max_seq_len,  # T5 encoder token limit (CLIP is always 77)
     )
 
     image = result.images[0]
@@ -424,7 +505,7 @@ def _sync_generate(request: GenerationRequest) -> tuple:
     generation_time_ms = int((time.time() - start_time) * 1000)
     logger.info(f"Generated in {generation_time_ms}ms, seed={seed}, {width}x{height}")
 
-    return img_bytes, seed, generation_time_ms, width, height
+    return img_bytes, seed, generation_time_ms, width, height, effective
 
 
 @app.on_event("startup")
@@ -457,8 +538,9 @@ async def root():
 
     return {
         "status": "online",
-        "model": "FLUX.1-schnell",
-        "version": "2.4.0",
+        "model": "FLUX.2-klein-4B",
+        "version": "3.0.0",
+        "license": "Apache 2.0 (commercial use allowed)",
         "memory_mode": "cpu_offload",
         "cuda_available": torch.cuda.is_available(),
         "current_gpu": current_gpu,
@@ -466,11 +548,11 @@ async def root():
         "auth_required": config.require_auth(),
         "queue_size": generation_queue.qsize() if generation_queue else 0,
         "max_queue_size": config.MAX_QUEUE_SIZE,
-        "default_settings": {
-            "aspect_ratio": "9:16",
-            "base_resolution": 576,
-            "num_inference_steps": 20,
-            "guidance_scale": 0.75
+        "runtime_settings": runtime_settings.to_dict(),
+        "endpoints": {
+            "settings": "GET /settings - view, POST /settings - update defaults",
+            "generate": "POST /generate - generate image",
+            "queue": "GET /queue/status - check queue"
         }
     }
 
@@ -483,6 +565,92 @@ async def queue_status():
         max_queue_size=config.MAX_QUEUE_SIZE,
         is_generating=queue_lock.locked()
     )
+
+
+# ============================================
+# Settings Management Endpoints
+# ============================================
+@app.get("/settings")
+async def get_settings():
+    """
+    Get current runtime settings (defaults used when not specified in request).
+    No authentication required - useful for checking current configuration.
+    """
+    return {
+        "settings": runtime_settings.to_dict(),
+        "description": "These are the default values used when not specified in generation request"
+    }
+
+
+@app.post("/settings")
+async def update_settings(
+    update: SettingsUpdate,
+    _: bool = Depends(verify_api_key)
+):
+    """
+    Update runtime settings on the fly. Only provided fields are updated.
+
+    Examples:
+    - Change steps: {"num_inference_steps": 15}
+    - Change LoRA: {"lora_path": "mymodel", "lora_scale": 0.7}
+    - Clear LoRA: {"lora_path": ""}
+    - Multiple: {"num_inference_steps": 25, "aspect_ratio": "1:1"}
+    """
+    changes = {}
+
+    if update.num_inference_steps is not None:
+        runtime_settings.num_inference_steps = update.num_inference_steps
+        changes["num_inference_steps"] = update.num_inference_steps
+
+    if update.guidance_scale is not None:
+        runtime_settings.guidance_scale = update.guidance_scale
+        changes["guidance_scale"] = update.guidance_scale
+
+    if update.aspect_ratio is not None:
+        # Validate aspect ratio
+        valid_ratios = list(ASPECT_RATIOS.keys()) + ["custom"]
+        if update.aspect_ratio not in valid_ratios:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid aspect_ratio. Valid options: {valid_ratios}"
+            )
+        runtime_settings.aspect_ratio = update.aspect_ratio
+        changes["aspect_ratio"] = update.aspect_ratio
+
+    if update.base_resolution is not None:
+        runtime_settings.base_resolution = update.base_resolution
+        changes["base_resolution"] = update.base_resolution
+
+    if update.lora_path is not None:
+        # Empty string means clear LoRA, otherwise set it
+        runtime_settings.lora_path = update.lora_path if update.lora_path else None
+        changes["lora_path"] = runtime_settings.lora_path
+
+    if update.lora_scale is not None:
+        runtime_settings.lora_scale = update.lora_scale
+        changes["lora_scale"] = update.lora_scale
+
+    if update.response_format is not None:
+        valid_formats = ["binary", "base64", "file"]
+        if update.response_format not in valid_formats:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid response_format. Valid options: {valid_formats}"
+            )
+        runtime_settings.response_format = update.response_format
+        changes["response_format"] = update.response_format
+
+    if update.max_sequence_length is not None:
+        runtime_settings.max_sequence_length = update.max_sequence_length
+        changes["max_sequence_length"] = update.max_sequence_length
+
+    logger.info(f"Settings updated: {changes}")
+
+    return {
+        "status": "updated",
+        "changes": changes,
+        "current_settings": runtime_settings.to_dict()
+    }
 
 
 @app.post("/generate")
@@ -518,7 +686,7 @@ async def generate_image(
         async with queue_lock:
             # Run generation in thread pool to not block event loop
             loop = asyncio.get_event_loop()
-            img_bytes, seed, generation_time_ms, width, height = await loop.run_in_executor(
+            img_bytes, seed, generation_time_ms, width, height, effective = await loop.run_in_executor(
                 None,
                 lambda: _sync_generate(request)
             )
@@ -536,8 +704,11 @@ async def generate_image(
         # Clear GPU cache after generation
         clear_gpu_cache()
 
+    # Get effective response format
+    resp_format = effective["response_format"]
+
     # Return based on requested format
-    if request.response_format == ResponseFormat.BINARY:
+    if resp_format == "binary":
         return Response(
             content=img_bytes,
             media_type="image/png",
@@ -549,18 +720,20 @@ async def generate_image(
             }
         )
 
-    elif request.response_format == ResponseFormat.BASE64:
+    elif resp_format == "base64":
         return JSONResponse(content={
             "image": base64.b64encode(img_bytes).decode("utf-8"),
             "seed": seed,
             "generation_time_ms": generation_time_ms,
             "width": width,
             "height": height,
-            "aspect_ratio": request.aspect_ratio.value,
-            "num_steps": request.num_inference_steps
+            "aspect_ratio": effective["aspect_ratio"],
+            "num_steps": effective["num_inference_steps"],
+            "lora_path": effective["lora_path"],
+            "lora_scale": effective["lora_scale"]
         })
 
-    elif request.response_format == ResponseFormat.FILE:
+    elif resp_format == "file":
         # Save to file
         filename = f"flux_{seed}_{int(time.time())}.png"
         file_path = Path(config.OUTPUT_DIR) / filename
@@ -573,8 +746,10 @@ async def generate_image(
             "generation_time_ms": generation_time_ms,
             "width": width,
             "height": height,
-            "aspect_ratio": request.aspect_ratio.value,
-            "num_steps": request.num_inference_steps
+            "aspect_ratio": effective["aspect_ratio"],
+            "num_steps": effective["num_inference_steps"],
+            "lora_path": effective["lora_path"],
+            "lora_scale": effective["lora_scale"]
         })
 
 
@@ -649,24 +824,20 @@ async def switch_gpu(request: GPUSwitchRequest, _: bool = Depends(verify_api_key
 
 if __name__ == "__main__":
     print(f"""
-    ========================================
-    Flux Schnell API Server v2.4.0
-    ========================================
-    Host: {config.HOST}
-    Port: {config.PORT}
-    Auth: {'Enabled' if config.require_auth() else 'Disabled (set FLUX_API_KEY in .env)'}
-    Max Queue: {config.MAX_QUEUE_SIZE}
-    Memory Mode: CPU Offload
-    ========================================
-    Default Settings:
-      Aspect Ratio: 9:16 (portrait)
-      Base Resolution: 576px (shorter side)
-      Inference Steps: 20
-      LoRA Scale: 0.1
-    ========================================
-    Using CPU offload - model layers move to
-    GPU only when needed during inference.
-    ========================================
+    ==========================================
+       Flux 2 Klein 4B API Server v3.0.0
+    ==========================================
+    Model: FLUX.2-klein-4B (Apache 2.0)
+    - 4B params (3x smaller than Schnell)
+    - Sub-second generation with 4 steps
+    - Only ~13GB VRAM required
+    ==========================================
+
+    Server: http://{config.HOST}:{config.PORT}
+    Auth: {'Enabled' if config.require_auth() else 'Disabled'}
+    GPU: {config.GPU_ID}
+
+    Defaults: {runtime_settings.num_inference_steps} steps, {runtime_settings.guidance_scale} guidance, {runtime_settings.aspect_ratio} aspect
     """)
 
     uvicorn.run(

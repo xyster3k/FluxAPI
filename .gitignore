@@ -64,3 +64,4 @@ desktop.ini
 *.tmp
 *.temp
 .cache/
+nul

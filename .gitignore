@@ -65,3 +65,4 @@ desktop.ini
 *.temp
 .cache/
 nul
+.claude/

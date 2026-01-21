@@ -1,23 +1,25 @@
-# Flux Schnell API Server Requirements
+# Flux 2 Multi-Model API Server Dependencies
+#
+# IMPORTANT: Do NOT install directly with pip install -r requirements.txt
+# Instead, run setup.bat which handles PyTorch CUDA and diffusers from git
+#
+# Manual installation order:
+# 1. PyTorch with CUDA: py -3.11 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# 2. Diffusers from git: py -3.11 -m pip install git+https://github.com/huggingface/diffusers
+# 3. Other deps: py -3.11 -m pip install -r requirements.txt
 
-# Core ML libraries
-torch>=2.1.0
-diffusers>=0.30.0
-transformers>=4.44.0
-accelerate>=0.33.0
-peft>=0.12.0
+# Hugging Face ecosystem
+transformers>=4.40.0
+accelerate>=0.27.0
+safetensors>=0.4.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# API server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+python-dotenv>=1.0.0
 
 # Image processing
 Pillow>=10.0.0
-
-# API server
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.0.0
-
-# Configuration
-python-dotenv>=1.0.0
-
-# Optional but recommended
-sentencepiece>=0.1.99
-protobuf>=3.20.0
